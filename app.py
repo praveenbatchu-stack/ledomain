@@ -285,49 +285,59 @@ def find_le_from_domain(domain, country=''):
                 'country': country,
                 'fwd_le': '', 'rev_le': '', 'web_le': ''}
 
-    # Group by normalized name
-    name_groups = {}
-    for c in found:
-        norm = _normalize_le_name(c['le_name'])
-        if norm not in name_groups:
-            name_groups[norm] = []
-        name_groups[norm].append(c)
+    # Priority: webfetch > fwd+rev agreement > any single
+    reason_parts = []
 
-    # Pick the most agreed-upon name
-    best_group = max(name_groups.values(), key=len)
-    agreement_count = len(best_group)
+    # Check if webfetch found something — it's the authority
+    if web.get('le_name'):
+        best = web
+        le_name = web['le_name']
+        cin = web.get('cin', '')
+        found_country = web.get('country', country)
+        reason_parts.append(f"webfetch: {web.get('reason', '')}")
 
-    # Prefer candidate with CIN
-    best = None
-    for c in best_group:
-        if c.get('cin'):
-            best = c
-            break
-    if not best:
-        best = best_group[0]
+        # Check if fwd/rev agree with webfetch
+        agree_count = 1
+        for other in [fwd, rev]:
+            if other.get('le_name') and _normalize_le_name(other['le_name']) == _normalize_le_name(le_name):
+                agree_count += 1
+        if agree_count >= 2:
+            confidence = 'high'
+            reason_parts.append(f'{agree_count}/3 methods agree')
+        else:
+            confidence = web.get('confidence', 'medium')
+            reason_parts.append('webfetch authority')
 
-    le_name = best['le_name']
-    cin = best.get('cin', '')
-    found_country = best.get('country', country)
-    reason_parts = [best.get('reason', '')]
+        # Flag if fwd/rev found something different
+        for label, other in [('forward', fwd), ('reverse', rev)]:
+            if other.get('le_name') and _normalize_le_name(other['le_name']) != _normalize_le_name(le_name):
+                reason_parts.append(f'{label} disagrees: {other["le_name"]}')
 
-    if agreement_count >= 2:
-        confidence = 'high'
-        reason_parts.append(f'{agreement_count}/3 methods agree')
-    elif agreement_count == 1 and best.get('confidence') == 'high':
-        confidence = 'medium'
-        reason_parts.append('single method, high individual confidence')
     else:
-        confidence = 'low'
-        reason_parts.append('single method only')
-
-    # Flag disagreement
-    if len(name_groups) > 1:
-        other_names = [c['le_name'] for group in name_groups.values()
-                       for c in group if _normalize_le_name(c['le_name']) != _normalize_le_name(le_name)]
-        if other_names:
+        # No webfetch — check if fwd and rev agree
+        if fwd.get('le_name') and rev.get('le_name') and \
+           _normalize_le_name(fwd['le_name']) == _normalize_le_name(rev['le_name']):
+            # Both agree — pick the one with CIN
+            best = fwd if fwd.get('cin') else rev
+            le_name = best['le_name']
+            cin = best.get('cin', '')
+            found_country = best.get('country', country)
+            confidence = 'medium'
+            reason_parts.append('fwd+rev agree (no webfetch)')
+        else:
+            # Only one found, or they disagree — pick whichever has higher confidence
+            candidates_sorted = sorted(found,
+                key=lambda c: ('high', 'medium', 'low', 'none').index(c.get('confidence', 'none')))
+            best = candidates_sorted[0]
+            le_name = best['le_name']
+            cin = best.get('cin', '')
+            found_country = best.get('country', country)
             confidence = 'low'
-            reason_parts.append(f'DISAGREEMENT: also found: {", ".join(other_names)}')
+            reason_parts.append(f"best single: {best.get('reason', '')}")
+            # Flag disagreement
+            for c in found:
+                if _normalize_le_name(c['le_name']) != _normalize_le_name(le_name):
+                    reason_parts.append(f'DISAGREEMENT: also found: {c["le_name"]}')
 
     return {
         'le_name': le_name,

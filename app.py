@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 # SECRETS → env vars (must happen before importing domain.py)
 # ---------------------------------------------------------------------------
-os.environ["OPENROUTER_API_KEY"] = "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"
+os.environ["OPENROUTER_API_KEY"] = "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"
 
 from domain import (
     check_forward, check_reverse, check_webfetch,

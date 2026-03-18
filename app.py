@@ -44,6 +44,30 @@ except Exception:
     HAS_CH = False
 
 # ---------------------------------------------------------------------------
+# RATE-LIMIT web_search (same as accuracy_check.py monkey-patch)
+# ---------------------------------------------------------------------------
+import domain as _domain_module
+
+_original_web_search = _domain_module.web_search
+_ddg_lock = threading.Lock()
+_ddg_last_call = [0.0]
+_DDG_MIN_GAP = 0.5
+_DDG_SEMAPHORE = threading.Semaphore(2)  # max 2 concurrent searches
+
+def _rate_limited_web_search(query, retries=2):
+    with _DDG_SEMAPHORE:
+        with _ddg_lock:
+            now = time.time()
+            gap = _DDG_MIN_GAP - (now - _ddg_last_call[0])
+            if gap > 0:
+                time.sleep(gap)
+            _ddg_last_call[0] = time.time()
+        return _original_web_search(query, retries=retries)
+
+_domain_module.web_search = _rate_limited_web_search
+web_search = _rate_limited_web_search  # also update local reference
+
+# ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 WORKERS = 4
@@ -320,7 +344,7 @@ def find_le_from_domain(domain, country=''):
 # ---------------------------------------------------------------------------
 # CORE: Accuracy check
 # ---------------------------------------------------------------------------
-def run_accuracy_check_single(domain, le_name, country='', cin=''):
+def run_accuracy_check_single(domain, le_name, country='', cin='', do_ch=False):
     """Run 3-check accuracy pipeline. Playwright retry if NO."""
     entry = {
         'entity_id': cin, 'country': country or '',
@@ -349,10 +373,10 @@ def run_accuracy_check_single(domain, le_name, country='', cin=''):
                     final2 = compute_final_verdict(merged2)
                     result = {**merged2, **final2}
 
-        # CH verification for UK
+        # CH verification (only when requested + UK)
         ch_result = {}
-        if country and ('kingdom' in country.lower() or 'uk' in (country or '').upper()):
-            if HAS_CH:
+        if do_ch and HAS_CH:
+            if country and ('kingdom' in country.lower() or 'uk' in (country or '').upper()):
                 ch_cin, ch_name, ch_st = ch_verify_exact(le_name, cin)
                 ch_result = {'ch_le_name': ch_name, 'ch_cin': ch_cin, 'ch_status': ch_st}
 
@@ -585,8 +609,9 @@ if df is not None:
 
         FIND_LE_HEADERS = ['domain', 'le_name', 'cin', 'country', 'confidence', 'reason',
                            'fwd_le', 'rev_le', 'web_le',
-                           'acc_webfetch_verdict', 'acc_final_verdict', 'acc_issue_notes',
-                           'ch_le_name', 'ch_cin', 'ch_status']
+                           'acc_webfetch_verdict', 'acc_final_verdict', 'acc_issue_notes']
+        if verify_ch and HAS_CH:
+            FIND_LE_HEADERS += ['ch_le_name', 'ch_cin', 'ch_status']
         BATCH_SIZE = 50
 
         if st.button("Run — Find LE", type="primary"):
@@ -634,26 +659,19 @@ if df is not None:
                     acc = run_accuracy_check_single(
                         entry['domain'], result['le_name'],
                         result.get('country', entry['country']),
-                        result.get('cin', ''))
+                        result.get('cin', ''),
+                        do_ch=verify_ch)
                     accuracy_data = {
                         'acc_webfetch_verdict': acc.get('webfetch_verdict', ''),
                         'acc_final_verdict': acc.get('final_mapping_correct', ''),
                         'acc_issue_notes': acc.get('final_issue_notes', ''),
                     }
-                    # CH data from accuracy check
-                    if acc.get('ch_le_name'):
+                    if verify_ch and acc.get('ch_le_name'):
                         ch_data = {
                             'ch_le_name': acc.get('ch_le_name', ''),
                             'ch_cin': acc.get('ch_cin', ''),
                             'ch_status': acc.get('ch_status', ''),
                         }
-
-                # Also try CH directly if not already done
-                if verify_ch and HAS_CH and result.get('le_name') and not ch_data:
-                    cty = result.get('country', entry['country'])
-                    if cty and ('kingdom' in cty.lower() or 'uk' in cty.upper() or 'england' in cty.lower()):
-                        ch_cin, ch_name, ch_st = ch_verify_exact(result['le_name'], result['cin'])
-                        ch_data = {'ch_le_name': ch_name, 'ch_cin': ch_cin, 'ch_status': ch_st}
 
                 return {**entry, **result, **accuracy_data, **ch_data}
 
@@ -721,6 +739,7 @@ if df is not None:
             cin_col = None
 
         default_country = st.text_input("Default country", "")
+        verify_ch_acc = st.checkbox("Verify on UK Companies House", value=False)
 
         ACCURACY_HEADERS = [
             'domain', 'le_name', 'country',
@@ -729,8 +748,9 @@ if df is not None:
             'webfetch_legal_name', 'webfetch_company_num', 'webfetch_parent',
             'webfetch_verdict', 'webfetch_confidence', 'webfetch_explanation',
             'final_mapping_correct', 'final_issue_notes',
-            'ch_le_name', 'ch_cin', 'ch_status',
         ]
+        if verify_ch_acc and HAS_CH:
+            ACCURACY_HEADERS += ['ch_le_name', 'ch_cin', 'ch_status']
         BATCH_SIZE = 50
 
         if st.button("Run — Check Accuracy", type="primary"):
@@ -772,7 +792,8 @@ if df is not None:
 
             def process_accuracy(entry):
                 return {**entry, **run_accuracy_check_single(
-                    entry['domain'], entry['le_name'], entry['country'], entry['cin'])}
+                    entry['domain'], entry['le_name'], entry['country'], entry['cin'],
+                    do_ch=verify_ch_acc)}
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(process_accuracy, e): e for e in entries}

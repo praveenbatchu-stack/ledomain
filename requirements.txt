@@ -6,3 +6,4 @@ google-auth
 google-api-python-client
 requests
 playwright
+ddgs

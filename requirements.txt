@@ -1,0 +1,8 @@
+streamlit>=1.30.0
+pandas
+openpyxl
+gspread
+google-auth
+google-api-python-client
+requests
+playwright

@@ -607,9 +607,15 @@ if df is not None:
         default_country = st.text_input("Default country (e.g. 'United Kingdom', 'India')", "")
         verify_ch = st.checkbox("Verify on UK Companies House (for UK domains)", value=True)
 
-        FIND_LE_HEADERS = ['domain', 'le_name', 'cin', 'country', 'confidence', 'reason',
-                           'fwd_le', 'rev_le', 'web_le',
-                           'acc_webfetch_verdict', 'acc_final_verdict', 'acc_issue_notes']
+        FIND_LE_HEADERS = [
+            'domain', 'le_name', 'cin', 'country', 'confidence', 'reason',
+            'fwd_le', 'rev_le', 'web_le',
+            'forward_found_domain', 'forward_match', 'forward_confidence',
+            'reverse_found_le', 'reverse_match', 'reverse_confidence',
+            'webfetch_legal_name', 'webfetch_company_num', 'webfetch_verdict',
+            'webfetch_confidence', 'webfetch_explanation',
+            'final_mapping_correct', 'final_issue_notes',
+        ]
         if verify_ch and HAS_CH:
             FIND_LE_HEADERS += ['ch_le_name', 'ch_cin', 'ch_status']
         BATCH_SIZE = 50
@@ -662,9 +668,19 @@ if df is not None:
                         result.get('cin', ''),
                         do_ch=verify_ch)
                     accuracy_data = {
-                        'acc_webfetch_verdict': acc.get('webfetch_verdict', ''),
-                        'acc_final_verdict': acc.get('final_mapping_correct', ''),
-                        'acc_issue_notes': acc.get('final_issue_notes', ''),
+                        'forward_found_domain': acc.get('forward_found_domain', ''),
+                        'forward_match': acc.get('forward_match', ''),
+                        'forward_confidence': acc.get('forward_confidence', ''),
+                        'reverse_found_le': acc.get('reverse_found_le', ''),
+                        'reverse_match': acc.get('reverse_match', ''),
+                        'reverse_confidence': acc.get('reverse_confidence', ''),
+                        'webfetch_legal_name': acc.get('webfetch_legal_name', ''),
+                        'webfetch_company_num': acc.get('webfetch_company_num', ''),
+                        'webfetch_verdict': acc.get('webfetch_verdict', ''),
+                        'webfetch_confidence': acc.get('webfetch_confidence', ''),
+                        'webfetch_explanation': acc.get('webfetch_explanation', ''),
+                        'final_mapping_correct': acc.get('final_mapping_correct', ''),
+                        'final_issue_notes': acc.get('final_issue_notes', ''),
                     }
                     if verify_ch and acc.get('ch_le_name'):
                         ch_data = {

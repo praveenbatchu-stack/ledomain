@@ -21,8 +21,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # SECRETS → env vars (must happen before importing domain.py)
+# Secrets are loaded from Streamlit secrets (.streamlit/secrets.toml)
+# or environment variables. Never hardcode credentials here.
 # ---------------------------------------------------------------------------
-os.environ["OPENROUTER_API_KEY"] = "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"
+import json as _json
+
+if "OPENROUTER_API_KEY" not in os.environ:
+    os.environ["OPENROUTER_API_KEY"] = st.secrets.get("OPENROUTER_API_KEY", "")
 
 from domain import (
     check_forward, check_reverse, check_webfetch,
@@ -81,22 +86,18 @@ web_search = _rate_limited_web_search  # also update local reference
 WORKERS = 4
 
 
-DRIVE_SA = {
-    "type": "service_account",
-    "project_id": "gen-lang-client-0203290094",
-    "private_key_id": "f26379559fbccf3af1031ba842aa2aece610ddbf",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDIXltI3uko1Rs3\nxYZHCgrRZlQ4DMlu55bNd9zjUnec4l/ab0H69uMK7xKupMTW25wiNMyvUyK50oSf\nk4TA+zfY5IoJUw5DPb/p1QpLLYfrBeq5mVNqlPWjbLjZg//BQPnTI/rg3I+26oT8\ni8aGdkxpjvAAmF0SN1LYQVxaGJfH0XYhdtlHXsXzfbMNCSHEUfXfD8AYWriemqkh\nvYywtYgXF4esP9bL7BV39m86jEno9skmB1CERWgM7pywHg3oMZRx4IqAPFswSi8T\n5+PdnNuvI9A3+NK5fZmgo0aSNqFgb5b5MjOgwl94BNbEnNXZccv2zwo45ska+Ybs\n2N+wKzwfAgMBAAECggEACa/Iw/twKYwxQP9TSt3pFfnXeno2cXPQGOYsOe/ZCS7x\n1Afq7ay/3zMdo8R4IQGu86xlH4NqZgdlEqiOvhxRtTJJ8MIg1Lld13p4K+2V6Okj\n/DhgYwJejw8I2g3amxzUDGlsjdsRNkDyOu9a9/yCHIb6LV0wVVrIA4fCujb+0ica\nmkXoCjC8tQqtdqrBptbwGKYEc31+1+FnNznKuQDjwO8HFv4EpzBH8/VEUXM6jMwI\n5m5TpdNXce0EneEUvVySX2oyyKIuJmg7hdqgJSGPZLSUE827O2Q0wkdtddglrx3C\nRSOZYhuenv4Cz2sEtCLtjKuIizyVtPfdDauu9ONzSQKBgQDwI3Ac20kH7OU4EANK\nFWTRgXLih8L1Aajugu9UKQGyDk4V3xcm9ezaE0wKMo1m+bnjY/hPMzv2Eh4/kcpg\nBktaP+EuzvmDk7tWPM4kGzdhSMSh6pRfFTbZgG/NU9rC+039Epz3NjGns/s0/68U\n2wpahEKL7G5xM8AFe7K/4nozSwKBgQDVmnCqehTO0rDy5N92waawo+YyTzrzywix\n+lLswbGskkxrM38QNo7NKcx/JwFkKGx1hEhQB6v3FsKVf3jug2R8EzGSkaT6Mz7H\nwfIvLLm8lImeQnkUZWD/iouQ8yOktbTeGpMXz5CGNo9ztKzH++AMZlB+7888AnY8\n/Q+qRlHB/QKBgQCaM+d2YEoRUMoQqheypvJKpnmDhfJnKl20a1gMDxkLoav613si\nhaFGmEWn9rZefdYkcrmtAhVq+k96OsBd0SzqE0Mir74CBAe0ZO9quB9j1TqPTvdf\n51uFZ7hjfYlo079M13r8NEzGiAi0C8v99Ho9jdi9yWFSSAzyeHBcT65w6QKBgQDT\ncGpARlJcnLCt7yLI4k5HoiYW/NjFROCZlMoLNHzU74iXwUTw3qCis9KKtyioZV9f\nQI94MO/nye7Zn3Is34FTVIiIpoUhaiKmB/Tc/6/n3T0QnIpQRz4qFpGq7RMGUxvz\nk2ixdDSCtnVvupQh7dDNVWYvEOEZbPJv0qx0B+GcXQKBgBexStbhvxPKSDJX0S27\nujgSj46OMM6QJiDLJah+EPMI9f+VRz2mkY33rxS+N0e4etorsmhk1LbQscqkwNsZ\ntxjDGIumaWjB6H/lkFKFFya14f63tthhpEbwsgTCQMLyiDPQqM8o8hzuwTBIfl62\nYtJB3VV690iSQswa1uBVsPdN\n-----END PRIVATE KEY-----\n",
-    "client_email": "fmaagent@gen-lang-client-0203290094.iam.gserviceaccount.com",
-    "client_id": "110276519274542550178",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/fmaagent%40gen-lang-client-0203290094.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com"
-}
-
 def _get_drive_sa():
-    return DRIVE_SA
+    """Load Google SA credentials from Streamlit secrets or env var."""
+    if "GOOGLE_SA_JSON" in st.secrets:
+        sa = dict(st.secrets["GOOGLE_SA_JSON"])
+        # Streamlit TOML escapes newlines; restore them in private_key
+        if "private_key" in sa:
+            sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+        return sa
+    if "GOOGLE_SA_JSON" in os.environ:
+        return _json.loads(os.environ["GOOGLE_SA_JSON"])
+    st.error("Missing GOOGLE_SA_JSON in secrets. Add it to .streamlit/secrets.toml or as an env var.")
+    st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +597,7 @@ if input_source == "Upload File":
         st.success(f"Loaded {len(df)} rows")
 
 elif input_source == "Google Sheet":
-    sa_email = _get_drive_sa().get("client_email", "fmaagent@gen-lang-client-0203290094.iam.gserviceaccount.com")
+    sa_email = _get_drive_sa().get("client_email", "mnc-278@omega-signifier-424714-g0.iam.gserviceaccount.com")
     st.info(f"Share your sheet with **{sa_email}** (Editor) before connecting.")
     sheet_url = st.text_input("Google Sheet URL")
     sheet_tab = st.text_input("Tab name (leave empty for auto-detect from URL)")

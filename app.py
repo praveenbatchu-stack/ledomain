@@ -26,8 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 import json as _json
 
-if "OPENROUTER_API_KEY" not in os.environ:
-    os.environ["OPENROUTER_API_KEY"] = st.secrets.get("OPENROUTER_API_KEY", "")
+if "NVIDIA_API_KEY" not in os.environ:
+    os.environ["NVIDIA_API_KEY"] = st.secrets.get("NVIDIA_API_KEY", "")
 
 from domain import (
     check_forward, check_reverse, check_webfetch,

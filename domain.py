@@ -39,8 +39,8 @@ from urllib.parse import urljoin
 LE_CSV     = 'le.csv'
 OUTPUT_CSV = 'accuracy_results.csv'
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
-TEXT_MODEL = "arcee-ai/trinity-large-preview:free"
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+TEXT_MODEL = "meta/llama-3.1-8b-instruct"
 
 WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches
@@ -237,15 +237,14 @@ def fetch_domain_pages(domain: str) -> str:
 # AI CALL
 # ---------------------------------------------------------------------------
 def ai_call(prompt: str, max_tokens: int = 700, max_retries: int = 5) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY not set.")
+    if not NVIDIA_API_KEY:
+        raise RuntimeError("NVIDIA_API_KEY not set.")
     for attempt in range(max_retries):
         try:
             resp = requests.post(
-                'https://openrouter.ai/api/v1/chat/completions',
+                'https://integrate.api.nvidia.com/v1/chat/completions',
                 headers={'Content-Type': 'application/json',
-                         'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                         'X-Title': 'DomainAccuracyTester'},
+                         'Authorization': f'Bearer {NVIDIA_API_KEY}'},
                 json={'model': TEXT_MODEL,
                       'messages': [
                           {'role': 'system', 'content': 'You are a precise entity verifier. Respond only with valid JSON.'},
@@ -779,13 +778,13 @@ def vicon(v):
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
-    global OPENROUTER_API_KEY
+    global NVIDIA_API_KEY
 
     # API key
-    if not OPENROUTER_API_KEY:
-        OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-    if not OPENROUTER_API_KEY:
-        log.error("OPENROUTER_API_KEY not set! export OPENROUTER_API_KEY=sk-or-...")
+    if not NVIDIA_API_KEY:
+        NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+    if not NVIDIA_API_KEY:
+        log.error("NVIDIA_API_KEY not set! export NVIDIA_API_KEY=nvapi-...")
         sys.exit(1)
 
     # le.csv

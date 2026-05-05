@@ -264,14 +264,17 @@ def fetch_page_text(url: str, max_chars=4000) -> str:
 
 
 def fetch_domain_pages(domain: str) -> str:
-    base = f"https://{domain}"
     collected = []
-    for path in FETCH_PATHS:
-        text = fetch_page_text(urljoin(base, path))
-        if text:
-            collected.append(f"=== {path} ===\n{text}")
-        if len(collected) >= 3:
-            break
+    for scheme in ('https', 'http'):
+        base = f"{scheme}://{domain}"
+        for path in FETCH_PATHS:
+            text = fetch_page_text(urljoin(base, path))
+            if text:
+                collected.append(f"=== {path} ===\n{text}")
+            if len(collected) >= 3:
+                break
+        if collected:
+            break  # HTTPS worked — don't retry over HTTP
     return "\n\n".join(collected)[:10000]
 
 
@@ -499,6 +502,10 @@ def check_webfetch(entry: dict) -> dict:
 
     log.info(f"  [WebFetch] {kd} ...")
     page_text = fetch_domain_pages(kd)
+
+    # JS-only SPA — static fetch useless, mark as failed so Playwright can retry
+    if page_text and 'enable javascript' in page_text.lower():
+        page_text = ''
 
     if not page_text.strip():
         return {'webfetch_legal_name': '', 'webfetch_company_num': '',

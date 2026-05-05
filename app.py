@@ -263,9 +263,9 @@ Respond ONLY with JSON:
 
 def _find_le_via_webfetch(domain, country=''):
     """Fetch actual website pages → AI extract LE info."""
-    page_text = fetch_domain_pages(domain)
-    if not page_text or len(page_text.strip()) < 100:
-        page_text = playwright_fetch_domain_pages(domain)
+    page_text = playwright_fetch_domain_pages(domain)
+    if not page_text or len(page_text.strip()) < 50:
+        page_text = fetch_domain_pages(domain)
     if not page_text or len(page_text.strip()) < 50:
         return {'le_name': '', 'cin': '', 'confidence': 'none',
                 'reason': 'could not fetch website', 'country': country}
@@ -508,33 +508,27 @@ Respond ONLY with JSON:
 # CORE: Accuracy check
 # ---------------------------------------------------------------------------
 def run_accuracy_check_single(domain, le_name, country='', cin='', do_ch=False):
-    """Run 3-check accuracy pipeline. Playwright retry if NO."""
+    """Run 3-check accuracy pipeline. Playwright is primary webfetch method."""
     entry = {
         'entity_id': cin, 'country': country or '',
         'known_domain': domain, 'known_le_name': le_name,
     }
     try:
-        with ThreadPoolExecutor(max_workers=3) as inner:
+        with ThreadPoolExecutor(max_workers=4) as inner:
             f_fwd = inner.submit(check_forward, entry)
             f_rev = inner.submit(check_reverse, entry)
-            f_web = inner.submit(check_webfetch, entry)
-            fwd, rev, web = f_fwd.result(), f_rev.result(), f_web.result()
+            f_pw  = inner.submit(playwright_fetch_domain_pages, domain)
+            fwd, rev = f_fwd.result(), f_rev.result()
+            pw_text = f_pw.result()
+
+        if pw_text and pw_text.strip():
+            web = _webfetch_with_text(entry, pw_text)
+        else:
+            web = check_webfetch(entry)  # static HTTP fallback
+
         merged = {**entry, **fwd, **rev, **web}
         final = compute_final_verdict(merged)
         result = {**merged, **final}
-
-        # Playwright retry if NO
-        if result.get('final_mapping_correct') == 'NO':
-            pw_text = playwright_fetch_domain_pages(domain)
-            if pw_text and pw_text.strip():
-                web2 = _webfetch_with_text(entry, pw_text)
-                old_v = web.get('webfetch_verdict', '')
-                new_v = web2.get('webfetch_verdict', '')
-                good = {'EXACT_MATCH', 'PARENT_MATCH', 'NAME_CHANGED', 'BRAND_NAME_MISMATCH'}
-                if new_v in good or (old_v not in good and new_v != old_v):
-                    merged2 = {**entry, **fwd, **rev, **web2}
-                    final2 = compute_final_verdict(merged2)
-                    result = {**merged2, **final2}
 
         # CH verification (only when requested + UK)
         ch_result = {}

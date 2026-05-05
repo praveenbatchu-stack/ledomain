@@ -57,54 +57,90 @@ except Exception:
     HAS_CH = False
 
 # ---------------------------------------------------------------------------
-# RATE-LIMIT web_search (same as accuracy_check.py monkey-patch)
+# NOTE: no global search rate-limit needed — domain.py's _ddgs_library_search
+# already has per-engine cooldown on 429/403 (yandex/ddg/bing rotation).
+# The standalone scripts (accuracy_check_us_le_domain.py) run with no global
+# limit and outperform; we match that here.
 # ---------------------------------------------------------------------------
-import domain as _domain_module
-
-_original_web_search = _domain_module.web_search
-_ddg_lock = threading.Lock()
-_ddg_last_call = [0.0]
-_DDG_MIN_GAP = 0.5
-_DDG_SEMAPHORE = threading.Semaphore(2)  # max 2 concurrent searches
-
-def _rate_limited_web_search(query, retries=2):
-    with _DDG_SEMAPHORE:
-        with _ddg_lock:
-            now = time.time()
-            gap = _DDG_MIN_GAP - (now - _ddg_last_call[0])
-            if gap > 0:
-                time.sleep(gap)
-            _ddg_last_call[0] = time.time()
-        return _original_web_search(query, retries=retries)
-
-_domain_module.web_search = _rate_limited_web_search
-web_search = _rate_limited_web_search  # also update local reference
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-WORKERS = 4
+WORKERS = 6
 
 
 def _get_drive_sa():
-    """Load Google SA credentials from Streamlit secrets or env var."""
+    """Load Google SA credentials.
+
+    Resolution order:
+      1. Streamlit secrets       (GOOGLE_SA_JSON table)            — Cloud / prod
+      2. Env var                 (GOOGLE_SA_JSON = full JSON text) — CI / scripted
+      3. Env var path            (GOOGLE_SA_JSON_PATH = file path) — explicit local
+      4. ../credentials/*.json   (auto-pick newest)                — local dev default
+    """
     if "GOOGLE_SA_JSON" in st.secrets:
         sa = dict(st.secrets["GOOGLE_SA_JSON"])
-        # Streamlit TOML escapes newlines; restore them in private_key
         if "private_key" in sa:
             sa["private_key"] = sa["private_key"].replace("\\n", "\n")
         return sa
     if "GOOGLE_SA_JSON" in os.environ:
         return _json.loads(os.environ["GOOGLE_SA_JSON"])
-    st.error("Missing GOOGLE_SA_JSON in secrets. Add it to .streamlit/secrets.toml or as an env var.")
+    if "GOOGLE_SA_JSON_PATH" in os.environ:
+        with open(os.environ["GOOGLE_SA_JSON_PATH"]) as f:
+            return _json.load(f)
+
+    # Local-dev fallback: auto-pick the newest *.json in ../credentials/
+    here = os.path.dirname(os.path.abspath(__file__))
+    cred_dir = os.path.join(os.path.dirname(here), "credentials")
+    if os.path.isdir(cred_dir):
+        candidates = [os.path.join(cred_dir, f) for f in os.listdir(cred_dir) if f.endswith(".json")]
+        candidates = [p for p in candidates if os.path.isfile(p)]
+        if candidates:
+            path = max(candidates, key=os.path.getmtime)
+            with open(path) as f:
+                sa = _json.load(f)
+            st.sidebar.caption(f"SA loaded from `credentials/{os.path.basename(path)}`")
+            return sa
+
+    st.error("No service account found. Set GOOGLE_SA_JSON in .streamlit/secrets.toml, "
+             "or set GOOGLE_SA_JSON_PATH env var, or drop a *.json into ../credentials/")
     st.stop()
 
 
 # ---------------------------------------------------------------------------
 # PLAYWRIGHT FETCH (JS-rendered sites) — graceful degradation on cloud
 # ---------------------------------------------------------------------------
+def _domain_alive(domain: str, timeout=4) -> bool:
+    """Cheap pre-check: DNS + HTTP HEAD. Skips Playwright on dead domains."""
+    import socket
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.gethostbyname(domain)
+    except Exception:
+        return False
+    try:
+        import requests
+        r = requests.head(f"https://{domain}", timeout=timeout, allow_redirects=True)
+        if r.status_code < 500:
+            return True
+    except Exception:
+        pass
+    try:
+        import requests
+        r = requests.head(f"http://{domain}", timeout=timeout, allow_redirects=True)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
 def playwright_fetch_domain_pages(domain):
-    """Playwright fallback for JS-rendered sites."""
+    """Playwright fallback for JS-rendered sites.
+
+    Pre-checks DNS+HEAD to skip dead domains (saves ~80s per dead row).
+    Caps at homepage + 1 priority path with tight timeouts.
+    """
+    if not _domain_alive(domain):
+        return ''
     try:
         from playwright.sync_api import sync_playwright
         from urllib.parse import urljoin, urlparse
@@ -119,8 +155,8 @@ def playwright_fetch_domain_pages(domain):
             page = browser.new_page()
             discovered_links = []
             try:
-                page.goto(base, timeout=20000, wait_until='domcontentloaded')
-                page.wait_for_timeout(2500)
+                page.goto(base, timeout=10000, wait_until='domcontentloaded')
+                page.wait_for_timeout(1500)
                 links = page.eval_on_selector_all('a[href]', """
                     els => els.map(el => ({href: el.href, text: el.textContent.trim().toLowerCase()}))
                 """)
@@ -139,18 +175,18 @@ def playwright_fetch_domain_pages(domain):
             except Exception:
                 pass
 
-            all_urls = list(dict.fromkeys(discovered_links[:5]))
-            for path in ['/privacy-policy', '/privacy', '/about', '/about-us', '/legal', '/terms']:
+            all_urls = list(dict.fromkeys(discovered_links[:3]))
+            for path in ['/privacy-policy', '/privacy', '/about']:
                 url = urljoin(base, path)
                 if url not in all_urls and url != base:
                     all_urls.append(url)
 
             for url in all_urls:
-                if len(collected) >= 4:
+                if len(collected) >= 2:   # homepage + 1 priority page is enough
                     break
                 try:
-                    page.goto(url, timeout=15000, wait_until='domcontentloaded')
-                    page.wait_for_timeout(1500)
+                    page.goto(url, timeout=8000, wait_until='domcontentloaded')
+                    page.wait_for_timeout(1000)
                     text = page.inner_text('body')
                     text = re.sub(r'\s+', ' ', text).strip()
                     if text and len(text) > 50:
@@ -372,6 +408,103 @@ def find_le_from_domain(domain, country=''):
 
 
 # ---------------------------------------------------------------------------
+# CORE: Find Domain from LE name (LE → Domain mapping)
+# ---------------------------------------------------------------------------
+_AGGREGATOR_DOMAINS = {
+    'linkedin.com', 'wikipedia.org', 'crunchbase.com', 'bloomberg.com',
+    'zoominfo.com', 'opencorporates.com', 'dnb.com', 'rocketreach.co',
+    'pitchbook.com', 'companieshouse.gov.uk', 'find-and-update.company-information.service.gov.uk',
+    'sec.gov', 'glassdoor.com', 'indeed.com', 'facebook.com', 'twitter.com',
+    'x.com', 'instagram.com', 'youtube.com', 'reddit.com', 'medium.com',
+    'github.com', 'gov.uk', 'goo.gl', 'tracxn.com',
+}
+
+
+def _clean_domain(d: str) -> str:
+    d = (d or '').strip().lower()
+    d = re.sub(r'^https?://', '', d)
+    d = re.sub(r'^www\.', '', d)
+    return d.split('/')[0].split('?')[0].split('#')[0]
+
+
+def find_domain_from_le(le_name, country='', cin=''):
+    """
+    Given an LE name (already a registered legal entity), find its OFFICIAL DOMAIN.
+
+    Pipeline:
+      1. Web search: "<le_name>" official website (and country / cin variants)
+      2. AI extracts the official domain from results — rejects directories/aggregators
+      3. Caller runs accuracy check on (LE, candidate_domain) to verify
+    """
+    queries = [
+        f'"{le_name}" official website',
+        f'"{le_name}" {country} official website' if country else None,
+        f'"{le_name}" {cin} official website' if cin else None,
+        f'"{le_name}" company homepage',
+    ]
+    queries = [q for q in queries if q]
+
+    results = []
+    for q in queries:
+        results = web_search(q)
+        if results:
+            break
+
+    if not results:
+        return {'le_name': le_name, 'found_domain': '',
+                'find_confidence': 'none',
+                'find_reason': 'no search results from any query',
+                'country': country, 'cin': cin}
+
+    ctx = "\n".join(
+        f"[{i+1}] URL: {r['url']}\n    Title: {r.get('title','')}\n    Snippet: {r.get('snippet','')}"
+        for i, r in enumerate(results[:10]))
+
+    country_hint = f' in {country}' if country else ''
+    prompt = f"""Find the OFFICIAL website domain owned by this exact legal entity{country_hint}.
+
+Entity Name:    "{le_name}"
+Registration ID: {cin}
+Country:        {country}
+
+Search results:
+{ctx}
+
+Rules:
+- OFFICIAL company website only — NOT LinkedIn, Wikipedia, Crunchbase, Bloomberg,
+  ZoomInfo, OpenCorporates, Companies House, SEC, Glassdoor, social media,
+  news articles, directories, or aggregators
+- Must match THIS EXACT entity and country — not a similarly-named foreign entity
+- Parked / for-sale / "domain available" pages = return empty ""
+- If unsure or no clear official site, return empty "" — false positive is worse than a miss
+
+Respond ONLY with JSON:
+{{"domain": "example.com", "confidence": "high|medium|low", "reason": "brief"}}"""
+
+    try:
+        r = parse_json_safe(ai_call(prompt, max_tokens=400))
+        found = _clean_domain(r.get('domain', ''))
+        # Reject obvious aggregators even if AI returned them
+        if found in _AGGREGATOR_DOMAINS or any(found.endswith('.' + a) for a in _AGGREGATOR_DOMAINS):
+            return {'le_name': le_name, 'found_domain': '',
+                    'find_confidence': 'low',
+                    'find_reason': f'AI returned aggregator domain "{found}" — rejected',
+                    'country': country, 'cin': cin}
+        return {
+            'le_name': le_name,
+            'found_domain': found,
+            'find_confidence': r.get('confidence', 'low') if found else 'none',
+            'find_reason': r.get('reason', ''),
+            'country': country,
+            'cin': cin,
+        }
+    except Exception as e:
+        return {'le_name': le_name, 'found_domain': '',
+                'find_confidence': 'error', 'find_reason': str(e),
+                'country': country, 'cin': cin}
+
+
+# ---------------------------------------------------------------------------
 # CORE: Accuracy check
 # ---------------------------------------------------------------------------
 def run_accuracy_check_single(domain, le_name, country='', cin='', do_ch=False):
@@ -524,8 +657,11 @@ def _idx_to_col(i):
     return chr(64 + (i - 1) // 26) + chr(65 + (i - 1) % 26)
 
 
-def get_or_create_result_tab(spreadsheet, tab_name, headers, source_data=None):
-    """Get or create a result tab. Returns worksheet + set of already-done domains."""
+def get_or_create_result_tab(spreadsheet, tab_name, headers, source_data=None, key_col='domain'):
+    """Get or create a result tab. Returns worksheet + set of already-done keys.
+
+    `key_col` is the header used as the resume key (e.g. 'domain' or 'le_name').
+    """
     import gspread
     try:
         ws = spreadsheet.worksheet(tab_name)
@@ -538,14 +674,14 @@ def get_or_create_result_tab(spreadsheet, tab_name, headers, source_data=None):
         ws.update('A1', [headers], value_input_option='RAW')
         time.sleep(0.5)
 
-    # Load already-done domains for resume
-    done_domains = set()
+    # Load already-done keys for resume
+    done_keys = set()
     all_data = ws.get_all_values()
-    domain_col_idx = headers.index('domain') if 'domain' in headers else 0
+    key_idx = headers.index(key_col) if key_col in headers else 0
     for row in all_data[1:]:
-        if len(row) > domain_col_idx and row[domain_col_idx].strip():
-            done_domains.add(row[domain_col_idx].strip().lower())
-    return ws, done_domains, len(all_data)
+        if len(row) > key_idx and row[key_idx].strip():
+            done_keys.add(row[key_idx].strip().lower())
+    return ws, done_keys, len(all_data)
 
 
 def write_batch_to_result_sheet(ws, rows, start_row, num_cols):
@@ -574,8 +710,11 @@ def write_batch_to_result_sheet(ws, rows, start_row, num_cols):
 st.set_page_config(page_title="Domain LE Console", page_icon="🔍", layout="wide")
 st.title("Domain LE Console")
 
-mode = st.sidebar.radio("Mode", ["Find LE (Domain Mapping)", "Check Accuracy"])
-workers = st.sidebar.slider("Parallel workers", 1, 8, WORKERS)
+mode = st.sidebar.radio(
+    "Mode",
+    ["Map Domain → LE", "Map LE → Domain", "Check Accuracy"],
+)
+workers = WORKERS  # fixed at 6 — matches accuracy_check_us_le_domain.py
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Input Source**")
@@ -597,8 +736,17 @@ if input_source == "Upload File":
         st.success(f"Loaded {len(df)} rows")
 
 elif input_source == "Google Sheet":
-    sa_email = _get_drive_sa().get("client_email", "mnc-278@omega-signifier-424714-g0.iam.gserviceaccount.com")
-    st.info(f"Share your sheet with **{sa_email}** (Editor) before connecting.")
+    sa_info = _get_drive_sa()
+    sa_email = sa_info.get("client_email", "")
+    sa_project = sa_info.get("project_id", "")
+    if sa_email:
+        st.info(
+            f"Share your sheet with **{sa_email}** (Editor) before connecting.  \n"
+            f"Project: `{sa_project}` — to swap, update `GOOGLE_SA_JSON` in "
+            f"`.streamlit/secrets.toml` (Streamlit Cloud → App settings → Secrets)."
+        )
+    else:
+        st.error("No service account loaded. Set GOOGLE_SA_JSON in .streamlit/secrets.toml")
     sheet_url = st.text_input("Google Sheet URL")
     sheet_tab = st.text_input("Tab name (leave empty for auto-detect from URL)")
     if sheet_url and st.button("Connect"):
@@ -611,7 +759,20 @@ elif input_source == "Google Sheet":
             st.session_state['gsheet_ws'] = gsheet_ws
             st.success(f"Connected! {len(df)} rows, tab: {gsheet_ws.title}")
         except Exception as e:
-            st.error(f"Error: {e}")
+            import traceback
+            err_type = type(e).__name__
+            err_msg = str(e) or '(no message)'
+            # gspread APIError carries response details on .response
+            extra = ''
+            resp = getattr(e, 'response', None)
+            if resp is not None:
+                try:
+                    extra = f"\nHTTP {resp.status_code}: {resp.text[:500]}"
+                except Exception:
+                    pass
+            st.error(f"**{err_type}**: {err_msg}{extra}")
+            with st.expander("Traceback"):
+                st.code(traceback.format_exc())
 
     if 'df' in st.session_state:
         df = st.session_state['df']
@@ -625,9 +786,9 @@ if df is not None:
     cols = list(df.columns)
 
     # -----------------------------------------------------------------------
-    # FIND LE MODE
+    # MAP DOMAIN → LE  (domain in, legal entity out)
     # -----------------------------------------------------------------------
-    if mode == "Find LE (Domain Mapping)":
+    if mode == "Map Domain → LE":
         st.subheader("Column Mapping")
         domain_col = st.selectbox("Domain column", cols, index=0)
         country_col = st.selectbox("Country column (optional)", ["-- None --"] + cols)
@@ -635,7 +796,7 @@ if df is not None:
             country_col = None
 
         default_country = st.text_input("Default country (e.g. 'United Kingdom', 'India')", "")
-        verify_ch = st.checkbox("Verify on UK Companies House (for UK domains)", value=True)
+        verify_ch = st.checkbox("Verify on UK Companies House (for UK domains)", value=False)
 
         FIND_LE_HEADERS = [
             'domain', 'le_name', 'cin', 'country', 'confidence', 'reason',
@@ -769,6 +930,156 @@ if df is not None:
 
             csv = results_df.to_csv(index=False)
             st.download_button("Download CSV", csv, "le_results.csv", "text/csv")
+
+    # -----------------------------------------------------------------------
+    # MAP LE → DOMAIN  (legal entity in, domain out, then verify)
+    # -----------------------------------------------------------------------
+    elif mode == "Map LE → Domain":
+        st.subheader("Column Mapping")
+        le_col = st.selectbox("LE Name column", cols, index=0)
+        country_col = st.selectbox("Country column (optional)", ["-- None --"] + cols)
+        cin_col = st.selectbox("Company Number column (optional)", ["-- None --"] + cols)
+        if country_col == "-- None --":
+            country_col = None
+        if cin_col == "-- None --":
+            cin_col = None
+
+        default_country = st.text_input("Default country (e.g. 'United Kingdom', 'India')", "")
+        verify_ch_lemap = st.checkbox("Verify on UK Companies House (for UK entities)", value=False)
+        skip_verify = st.checkbox("Skip accuracy verification (faster, just find domain)", value=False)
+
+        MAP_LE_HEADERS = [
+            'le_name', 'country', 'cin',
+            'found_domain', 'find_confidence', 'find_reason',
+            'forward_found_domain', 'forward_match', 'forward_confidence',
+            'reverse_found_le', 'reverse_match', 'reverse_confidence',
+            'webfetch_legal_name', 'webfetch_company_num', 'webfetch_verdict',
+            'webfetch_confidence', 'webfetch_explanation',
+            'final_mapping_correct', 'final_issue_notes',
+        ]
+        if verify_ch_lemap and HAS_CH:
+            MAP_LE_HEADERS += ['ch_le_name', 'ch_cin', 'ch_status']
+        BATCH_SIZE = 50
+
+        if st.button("Run — Map LE → Domain", type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            result_ws = None
+            done_keys = set()
+            next_row = [2]
+            spreadsheet = None
+
+            if gsheet_ws:
+                spreadsheet = gsheet_ws.spreadsheet
+                result_ws, done_keys, existing_rows = get_or_create_result_tab(
+                    spreadsheet, "LE → Domain Results", MAP_LE_HEADERS, key_col='le_name')
+                next_row[0] = existing_rows + 1 if existing_rows > 1 else 2
+                if done_keys:
+                    st.info(f"Resuming — {len(done_keys)} LE names already done")
+
+            entries = []
+            for idx, row in df.iterrows():
+                le_name = str(row[le_col]).strip()
+                if not le_name or le_name.lower() == 'nan':
+                    continue
+                if le_name.lower() in done_keys:
+                    continue
+                country = str(row[country_col]).strip() if country_col else default_country
+                cin = str(row[cin_col]).strip() if cin_col else ''
+                entries.append({'idx': idx, 'le_name': le_name,
+                                'country': country, 'cin': cin})
+
+            results = []
+            pending_rows = []
+            lock = threading.Lock()
+            completed = [0]
+            found = [0]
+
+            def process_map_le(entry):
+                find_result = find_domain_from_le(
+                    entry['le_name'], entry['country'], entry['cin'])
+                accuracy_data = {}
+                ch_data = {}
+
+                if find_result.get('found_domain') and not skip_verify:
+                    acc = run_accuracy_check_single(
+                        find_result['found_domain'],
+                        entry['le_name'],
+                        entry['country'],
+                        entry['cin'],
+                        do_ch=verify_ch_lemap)
+                    accuracy_data = {
+                        'forward_found_domain': acc.get('forward_found_domain', ''),
+                        'forward_match': acc.get('forward_match', ''),
+                        'forward_confidence': acc.get('forward_confidence', ''),
+                        'reverse_found_le': acc.get('reverse_found_le', ''),
+                        'reverse_match': acc.get('reverse_match', ''),
+                        'reverse_confidence': acc.get('reverse_confidence', ''),
+                        'webfetch_legal_name': acc.get('webfetch_legal_name', ''),
+                        'webfetch_company_num': acc.get('webfetch_company_num', ''),
+                        'webfetch_verdict': acc.get('webfetch_verdict', ''),
+                        'webfetch_confidence': acc.get('webfetch_confidence', ''),
+                        'webfetch_explanation': acc.get('webfetch_explanation', ''),
+                        'final_mapping_correct': acc.get('final_mapping_correct', ''),
+                        'final_issue_notes': acc.get('final_issue_notes', ''),
+                    }
+                    if verify_ch_lemap and acc.get('ch_le_name'):
+                        ch_data = {
+                            'ch_le_name': acc.get('ch_le_name', ''),
+                            'ch_cin': acc.get('ch_cin', ''),
+                            'ch_status': acc.get('ch_status', ''),
+                        }
+
+                return {**entry, **find_result, **accuracy_data, **ch_data}
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(process_map_le, e): e for e in entries}
+                for future in as_completed(futures):
+                    try:
+                        out = future.result()
+                        with lock:
+                            results.append(out)
+                            completed[0] += 1
+                            if out.get('found_domain'):
+                                found[0] += 1
+
+                            row_vals = [str(out.get(h, '')) for h in MAP_LE_HEADERS]
+                            pending_rows.append(row_vals)
+
+                            if result_ws and len(pending_rows) >= BATCH_SIZE:
+                                write_batch_to_result_sheet(
+                                    result_ws, pending_rows, next_row[0], len(MAP_LE_HEADERS))
+                                next_row[0] += len(pending_rows)
+                                pending_rows.clear()
+                                time.sleep(1)
+
+                            pct = completed[0] / len(entries) if entries else 1
+                            progress_bar.progress(pct)
+                            status_text.text(
+                                f"Processed {completed[0]}/{len(entries)} — "
+                                f"Domain found: {found[0]}")
+                    except Exception:
+                        with lock:
+                            completed[0] += 1
+
+            if result_ws and pending_rows:
+                write_batch_to_result_sheet(
+                    result_ws, pending_rows, next_row[0], len(MAP_LE_HEADERS))
+                pending_rows.clear()
+
+            results_df = pd.DataFrame(results)
+            results_df = results_df[[c for c in MAP_LE_HEADERS if c in results_df.columns]]
+            st.session_state['results_df'] = results_df
+
+            st.success(f"Done! Found domain for {found[0]}/{len(entries)} LE names")
+            if result_ws:
+                sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet.id}"
+                st.success(f"Results written to **LE → Domain Results** tab → [Open Sheet]({sheet_url})")
+            st.dataframe(results_df, use_container_width=True)
+
+            csv = results_df.to_csv(index=False)
+            st.download_button("Download CSV", csv, "le_to_domain_results.csv", "text/csv")
 
     # -----------------------------------------------------------------------
     # CHECK ACCURACY MODE

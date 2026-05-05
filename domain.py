@@ -29,6 +29,7 @@ import re
 import sys
 import time
 import logging
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
@@ -40,7 +41,8 @@ LE_CSV     = 'le.csv'
 OUTPUT_CSV = 'accuracy_results.csv'
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-TEXT_MODEL = "meta/llama-3.1-8b-instruct"
+# Match accuracy_check_us_le_domain.py / parent domain.py:
+TEXT_MODEL = "mistralai/mistral-small-4-119b-2603"
 
 WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches
@@ -129,29 +131,69 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # WEB SEARCH
 # ---------------------------------------------------------------------------
+# Pinned to engines that actually return 200s in our environment.
+# Brave/Google/Mojeek/Yahoo (the default `auto` fan-out) hammer us with 429/403.
+# Yandex is the most reliable; DDG and Bing are secondary.
+_ENGINE_PREFERENCE = ['yandex', 'duckduckgo', 'bing']
+_ENGINE_COOLDOWN_UNTIL = {}
+_engine_lock = threading.Lock()
+
+
+def _engine_is_cool(engine: str) -> bool:
+    with _engine_lock:
+        return time.time() >= _ENGINE_COOLDOWN_UNTIL.get(engine, 0)
+
+
+def _engine_cooldown(engine: str, seconds: int):
+    until = time.time() + seconds
+    with _engine_lock:
+        _ENGINE_COOLDOWN_UNTIL[engine] = max(_ENGINE_COOLDOWN_UNTIL.get(engine, 0), until)
+
+
 def _ddgs_library_search(query: str, max_results=8):
-    """Primary: use ddgs library with 429 backoff."""
-    for ddg_attempt in range(3):
-        try:
-            from ddgs import DDGS
-            results = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results):
-                    results.append({
-                        'url': r.get('href', ''),
-                        'title': r.get('title', ''),
-                        'snippet': r.get('body', '')
-                    })
-            return results
-        except Exception as e:
-            err_str = str(e).lower()
-            if '429' in err_str or 'ratelimit' in err_str:
-                wait = 5 * (ddg_attempt + 1)
-                log.warning(f"DDG 429 rate limit — backing off {wait}s (attempt {ddg_attempt+1}/3)")
-                time.sleep(wait)
-                continue
-            log.debug(f"DDGS library error: {e}")
-            return []
+    """ddgs library, pinned to working engines (Yandex → DDG → Bing).
+
+    Per-engine cooldown on 429/403 so we don't keep hitting blocked backends.
+    """
+    try:
+        from ddgs import DDGS
+    except Exception as e:
+        log.debug(f"ddgs import failed: {e}")
+        return []
+
+    last_err = None
+    for engine in _ENGINE_PREFERENCE:
+        if not _engine_is_cool(engine):
+            log.debug(f"skip {engine} (cooling)")
+            continue
+        for attempt in range(2):
+            try:
+                results = []
+                with DDGS() as ddgs:
+                    for r in ddgs.text(query, max_results=max_results, backend=engine):
+                        results.append({
+                            'url': r.get('href', ''),
+                            'title': r.get('title', ''),
+                            'snippet': r.get('body', ''),
+                        })
+                if results:
+                    return results
+                break  # empty but not an error → next engine
+            except Exception as e:
+                last_err = e
+                err = str(e).lower()
+                if '429' in err or 'ratelimit' in err or '403' in err:
+                    cool = 60 if engine == 'yandex' else 180
+                    _engine_cooldown(engine, cool)
+                    log.warning(f"{engine} blocked ({err[:60]}) — cooldown {cool}s")
+                    break
+                if 'timed out' in err or 'timeout' in err:
+                    time.sleep(1)
+                    continue
+                log.debug(f"{engine} error: {e}")
+                break
+    if last_err:
+        log.debug(f"all pinned engines failed, last err: {last_err}")
     return []
 
 

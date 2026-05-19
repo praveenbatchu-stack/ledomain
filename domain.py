@@ -41,7 +41,7 @@ LE_CSV     = 'le.csv'
 OUTPUT_CSV = 'accuracy_results.csv'
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-# Match accuracy_check_us_le_domain.py / parent domain.py:
+# Match the LE domain console model configured for NVIDIA NIM calls.
 TEXT_MODEL = "mistralai/mixtral-8x22b-instruct-v0.1"
 
 WORKERS    = 3

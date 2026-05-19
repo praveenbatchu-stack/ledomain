@@ -42,7 +42,7 @@ OUTPUT_CSV = 'accuracy_results.csv'
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 # Match accuracy_check_us_le_domain.py / parent domain.py:
-TEXT_MODEL = "mistralai/mistral-small-4-119b-2603"
+TEXT_MODEL = "mistralai/mixtral-8x22b-instruct-v0.1"
 
 WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches

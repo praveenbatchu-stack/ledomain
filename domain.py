@@ -42,7 +42,7 @@ OUTPUT_CSV = 'accuracy_results.csv'
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 # Match the LE domain console model configured for NVIDIA NIM calls.
-TEXT_MODEL = "meta/llama-3.1-8b-instruct"
+TEXT_MODEL = "mistralai/mistral-small-4-119b-2603"
 
 WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches

@@ -124,7 +124,7 @@ def _next_nvidia_key():
 
 # NVIDIA NIM text model — override with NVIDIA_TEXT_MODEL env var.
 # Matches the LE domain console model configured for NVIDIA NIM calls.
-TEXT_MODEL = os.environ.get("NVIDIA_TEXT_MODEL", "mistralai/mistral-small-4-119b-2603")
+TEXT_MODEL = os.environ.get("NVIDIA_TEXT_MODEL", "meta/llama-3.1-8b-instruct")
 
 WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches

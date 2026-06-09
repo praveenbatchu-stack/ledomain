@@ -32,7 +32,7 @@ import logging
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -130,8 +130,12 @@ WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches
 FETCH_TO   = 12     # seconds for website fetch timeout
 
-FETCH_PATHS = ['/', '/about', '/about-us', '/privacy-policy',
-               '/privacy', '/legal', '/terms', '/company']
+# Ordered by how reliably each page carries the REGISTERED legal entity name.
+# /contact, /privacy, /terms, /legal, /imprint typically disclose "<Brand> is
+# operated by <Legal Co Pvt Ltd>, <address>" even when the homepage only shows
+# the brand — so they come right after '/' and ahead of marketing /about pages.
+FETCH_PATHS = ['/', '/contact', '/contact-us', '/privacy-policy', '/privacy',
+               '/terms', '/legal', '/imprint', '/about', '/about-us', '/company']
 
 HTTP_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -285,31 +289,109 @@ def web_search(query: str, retries=3):
 # ---------------------------------------------------------------------------
 # WEBSITE FETCHER
 # ---------------------------------------------------------------------------
-def fetch_page_text(url: str, max_chars=4000) -> str:
+def fetch_page(url: str, max_chars=4000):
+    """Fetch a URL and return (raw_html, cleaned_text). Raw HTML is needed so
+    callers can extract the page's own <a href> links (FWS-style discovery);
+    cleaned text is the script/style-stripped, whitespace-collapsed body."""
     try:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=FETCH_TO, allow_redirects=True)
         if resp.status_code >= 400:
-            return ''
+            return '', ''
         html = resp.text
-        html = re.sub(r'<(script|style)[^>]*>.*?</(script|style)>', ' ', html,
-                      flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<[^>]+>', ' ', html)
+        stripped = re.sub(r'<(script|style)[^>]*>.*?</(script|style)>', ' ', html,
+                          flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', stripped)
         text = re.sub(r'\s+', ' ', text).strip()
-        return text[:max_chars]
+        return html, text[:max_chars]
     except Exception as e:
         log.debug(f"Fetch {url}: {e}")
-        return ''
+        return '', ''
 
 
-def fetch_domain_pages(domain: str) -> str:
+def fetch_page_text(url: str, max_chars=4000) -> str:
+    return fetch_page(url, max_chars)[1]
+
+
+# Page types most likely to disclose the REGISTERED legal entity, scored by how
+# reliably each one carries "<Brand> is operated by <Legal Co Pvt Ltd>, <addr>".
+# Used to rank the homepage's OWN links so a non-standard URL (/get-in-touch,
+# /en/impressum, /company/legal-information) is still followed — unlike a fixed
+# path list that only hits guessed slugs.
+_PAGE_KEYWORDS = [
+    (10, ('contact', 'get-in-touch', 'getintouch', 'reach-us', 'reachus', 'kontakt')),
+    (9,  ('imprint', 'impressum', 'mentions-legales')),
+    (8,  ('legal', 'disclaimer', 'disclosure', 'disclosures')),
+    (7,  ('privacy', 'datenschutz')),
+    (6,  ('terms', 'agb', 'conditions')),
+    (5,  ('about', 'aboutus', 'who-we-are', 'company', 'corporate', 'overview')),
+    (3,  ('team', 'people', 'leadership')),
+]
+
+_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL)
+
+
+def _score_link(href: str, text: str) -> int:
+    blob = f"{href} {text}".lower()
+    return max((s for s, kws in _PAGE_KEYWORDS if any(k in blob for k in kws)),
+               default=0)
+
+
+def _discover_relevant_links(home_html: str, base: str, domain: str,
+                             limit: int = 8) -> list:
+    """Parse the homepage's own anchors and return the internal URLs most likely
+    to disclose the registered legal entity (contact/imprint/legal/privacy/
+    about), highest-confidence first. Mirrors FWS 3.0's link-summary crawl:
+    follow the links the site actually exposes instead of guessing paths."""
+    reg = domain.lower().lstrip('www.')
+    scored: dict[str, int] = {}
+    for m in _ANCHOR_RE.finditer(home_html or ''):
+        href = m.group(1).strip()
+        if not href or href.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+            continue
+        text = re.sub(r'<[^>]+>', ' ', m.group(2))
+        full = urljoin(base, href)
+        host = urlparse(full).netloc.lower().lstrip('www.')
+        if host and reg not in host and host not in reg:
+            continue  # off-site link (social, partner, CDN)
+        s = _score_link(href, text)
+        if s <= 0:
+            continue
+        key = full.split('#')[0].rstrip('/')
+        if s > scored.get(key, 0):
+            scored[key] = s
+    return [u for u, _ in sorted(scored.items(), key=lambda kv: -kv[1])][:limit]
+
+
+def fetch_domain_pages(domain: str, min_pages: int = 6) -> str:
+    """Fetch the homepage, then follow the site's own legal/contact/about links
+    (discovered from the homepage HTML) plus common fixed-path fallbacks, until
+    at least `min_pages` pages are collected — so the registered legal entity on
+    a /contact or /impressum page is seen even when the homepage shows only a
+    brand."""
     collected = []
     for scheme in ('https', 'http'):
         base = f"{scheme}://{domain}"
-        for path in FETCH_PATHS:
-            text = fetch_page_text(urljoin(base, path))
+        home_html, home_text = fetch_page(urljoin(base, '/'))
+        if not home_text:
+            continue
+        collected.append(f"=== / ===\n{home_text}")
+        seen = {urljoin(base, '/').split('#')[0].rstrip('/')}
+        # Dynamically discovered links first, then fixed-path fallbacks for any
+        # legal page the homepage didn't link to directly.
+        candidates = _discover_relevant_links(home_html, base, domain)
+        candidates += [urljoin(base, p) for p in FETCH_PATHS if p != '/']
+        for url in candidates:
+            key = url.split('#')[0].rstrip('/')
+            if key in seen:
+                continue
+            seen.add(key)
+            text = fetch_page_text(url)
             if text:
-                collected.append(f"=== {path} ===\n{text}")
-            if len(collected) >= 3:
+                label = urlparse(url).path or url
+                collected.append(f"=== {label} ===\n{text}")
+            if len(collected) >= min_pages:
                 break
         if collected:
             break  # HTTPS worked — don't retry over HTTP
@@ -570,11 +652,11 @@ EXPECTED ENTITY:
   Registration ID: {eid}
   Country:         {cty}
 
-WEBSITE CONTENT (excerpts from /, /about, /privacy-policy etc.):
+WEBSITE CONTENT (excerpts from /, /contact, /privacy-policy etc.):
 {page_text[:7000]}
 
 ANALYSIS TASK:
-1. What LEGAL/REGISTERED company name does this site show? (check footer, privacy policy, about page, company number disclosures)
+1. What LEGAL/REGISTERED company name does this site show? (check the CONTACT page, footer, privacy policy, terms, about page, company number disclosures — the registered "<Legal Co> Pvt Ltd / Inc / Ltd" + address is often only on the contact/privacy page even when the homepage shows only a brand). Treat a "<Brand> is operated by / a product of <Legal Co>" disclosure, or a matching registered name+address, as confirming the entity.
 2. Any company registration number mentioned?
 3. Is a PARENT COMPANY or HOLDING COMPANY mentioned?
 4. Does this domain correctly belong to "{kle}"?

@@ -1,0 +1,18 @@
+services:
+  console:
+    build: .
+    image: le-domain-console:latest
+    container_name: le-domain-console
+    restart: unless-stopped
+    ports:
+      - "80:7860"          # host :80 -> container :7860 (Streamlit)
+    env_file:
+      - .env               # NVIDIA_API_KEY (+ optional GOOGLE_SA_JSON)
+    volumes:
+      # Google service-account JSON — app.py auto-picks newest *.json in ../credentials/
+      # Container WORKDIR is /home/pwuser/app, so credentials must sit one level up.
+      - ../credentials:/home/pwuser/credentials:ro
+    # Chromium (Playwright) needs a larger /dev/shm or it crashes on heavy pages
+    shm_size: "1gb"
+    # Keep memory in check on a small box; raise if you size up the instance
+    mem_limit: 3g

@@ -27,12 +27,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json as _json
 
 if "NVIDIA_API_KEY" not in os.environ:
-    os.environ["NVIDIA_API_KEY"] = st.secrets.get("NVIDIA_API_KEY", "")
+    try:
+        os.environ["NVIDIA_API_KEY"] = st.secrets.get("NVIDIA_API_KEY", "")
+    except Exception:
+        os.environ["NVIDIA_API_KEY"] = ""
+
+if "NVIDIA_TEXT_MODEL" not in os.environ:
+    try:
+        _model = st.secrets.get("NVIDIA_TEXT_MODEL", "")
+        if _model:
+            os.environ["NVIDIA_TEXT_MODEL"] = _model
+    except Exception:
+        pass
 
 from domain import (
     check_forward, check_reverse, check_webfetch,
     compute_final_verdict, ai_call, parse_json_safe,
-    web_search, fetch_domain_pages,
+    web_search, fetch_domain_pages, HTTP_HEADERS,
     names_are_equivalent, fuzzy_name_match,
     GOOD_VERDICTS as _GOOD_VERDICTS,
     _resolve_mismatch_via_search,
@@ -73,18 +84,26 @@ def _get_drive_sa():
     """Load Google SA credentials.
 
     Resolution order:
-      1. Streamlit secrets       (GOOGLE_SA_JSON table)            — Cloud / prod
+      1. Streamlit secrets       (GOOGLE_SA_JSON or gcp_service_account) — Cloud / prod
       2. Env var                 (GOOGLE_SA_JSON = full JSON text) — CI / scripted
       3. Env var path            (GOOGLE_SA_JSON_PATH = file path) — explicit local
       4. ../credentials/*.json   (auto-pick newest)                — local dev default
     """
-    if "GOOGLE_SA_JSON" in st.secrets:
-        sa = dict(st.secrets["GOOGLE_SA_JSON"])
+    try:
+        for key in ("GOOGLE_SA_JSON", "gcp_service_account"):
+            if key in st.secrets:
+                raw = st.secrets[key]
+                sa = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+                if "private_key" in sa:
+                    sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+                return sa
+    except Exception:
+        pass
+    if "GOOGLE_SA_JSON" in os.environ:
+        sa = _json.loads(os.environ["GOOGLE_SA_JSON"])
         if "private_key" in sa:
             sa["private_key"] = sa["private_key"].replace("\\n", "\n")
         return sa
-    if "GOOGLE_SA_JSON" in os.environ:
-        return _json.loads(os.environ["GOOGLE_SA_JSON"])
     if "GOOGLE_SA_JSON_PATH" in os.environ:
         with open(os.environ["GOOGLE_SA_JSON_PATH"]) as f:
             return _json.load(f)
@@ -131,6 +150,44 @@ def _domain_alive(domain: str, timeout=4) -> bool:
         return r.status_code < 500
     except Exception:
         return False
+
+
+_HOST_CACHE = {}
+_HOST_CACHE_LOCK = threading.Lock()
+
+
+def _resolve_host(domain: str) -> str:
+    """Pick the host variant (apex vs www.) that actually serves a live homepage.
+
+    Some sites' TLS cert covers only www (or only apex), so the wrong variant
+    dies with an SSLError and the whole webfetch returns empty. Try both and
+    keep whichever returns a real 2xx/3xx homepage.
+    """
+    domain = (domain or '').strip().lower()
+    if not domain:
+        return domain
+    with _HOST_CACHE_LOCK:
+        if domain in _HOST_CACHE:
+            return _HOST_CACHE[domain]
+
+    bare = re.sub(r'^www\.', '', domain)
+    candidates = [domain] + [c for c in (f'www.{bare}', bare) if c != domain]
+    import requests
+    resolved = domain
+    for host in candidates:
+        try:
+            r = requests.get(f'https://{host}', headers=HTTP_HEADERS,
+                             timeout=8, allow_redirects=True, stream=True)
+            r.close()
+            if r.status_code < 400:
+                resolved = host
+                break
+        except Exception:
+            continue
+
+    with _HOST_CACHE_LOCK:
+        _HOST_CACHE[domain] = resolved
+    return resolved
 
 
 def playwright_fetch_domain_pages(domain):
@@ -263,6 +320,7 @@ Respond ONLY with JSON:
 
 def _find_le_via_webfetch(domain, country=''):
     """Fetch actual website pages → AI extract LE info."""
+    domain = _resolve_host(domain)
     page_text = playwright_fetch_domain_pages(domain)
     if not page_text or len(page_text.strip()) < 50:
         page_text = fetch_domain_pages(domain)

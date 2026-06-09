@@ -40,9 +40,91 @@ from urllib.parse import urljoin
 LE_CSV     = 'le.csv'
 OUTPUT_CSV = 'accuracy_results.csv'
 
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-# Match the LE domain console model configured for NVIDIA NIM calls.
-TEXT_MODEL = "mistralai/mistral-small-4-119b-2603"
+def _load_dotenv():
+    """Zero-dependency .env loader (python-dotenv isn't installed in the
+    anaconda env). Reads KEY=VALUE lines from console/.env and the project
+    root .env into os.environ *without* clobbering vars already set by the
+    caller. Quotes and inline whitespace around '=' are stripped."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, '.env'),
+                 os.path.join(here, os.pardir, '.env')):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except FileNotFoundError:
+            continue
+
+
+_load_dotenv()
+
+
+def _load_nvidia_keys():
+    """Build the NVIDIA NIM key pool. Sources, in priority order:
+        1. NVIDIA_API_KEYS  — comma/newline-separated list (the rotation pool)
+        2. NVIDIA_API_KEY   — single key, pushed to the front of the pool
+    Falls back to the bundled pool below if the env has none. Order is
+    preserved and duplicates removed."""
+    keys = []
+    single = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if single:
+        keys.append(single)
+    raw = os.environ.get("NVIDIA_API_KEYS", "")
+    keys.extend(k.strip() for k in re.split(r"[,\n]", raw) if k.strip())
+    if not keys:
+        keys = list(_DEFAULT_NVIDIA_KEYS)
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+# Fallback rotation pool used only when neither NVIDIA_API_KEY nor
+# NVIDIA_API_KEYS is set in the environment / .env.
+_DEFAULT_NVIDIA_KEYS = [
+    "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",
+    "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",
+    "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",
+    "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",
+    "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",
+]
+
+# Pool of NVIDIA NIM keys round-robined across all ai_call() attempts so a
+# single key's per-minute 429 isn't the bottleneck (mirrors FWS
+# automate_jp.py's rotation over scrape_japan.NVIDIA_API_KEYS).
+NVIDIA_API_KEYS = _load_nvidia_keys()
+# Back-compat alias: first key in the pool. Some call-sites / main() still
+# reference NVIDIA_API_KEY for the "is anything configured?" check.
+NVIDIA_API_KEY = NVIDIA_API_KEYS[0] if NVIDIA_API_KEYS else ""
+
+_NV_KEY_LOCK = threading.Lock()
+_NV_KEY_IDX = [0]
+
+
+def _next_nvidia_key():
+    """Thread-safe round-robin over NVIDIA_API_KEYS. Each ai_call() attempt
+    (and each concurrent worker) pulls the next key, so retries after a 429
+    land on a different key instead of hammering the same one."""
+    if not NVIDIA_API_KEYS:
+        return ""
+    with _NV_KEY_LOCK:
+        idx = _NV_KEY_IDX[0] % len(NVIDIA_API_KEYS)
+        _NV_KEY_IDX[0] += 1
+        return NVIDIA_API_KEYS[idx]
+
+
+# NVIDIA NIM text model — override with NVIDIA_TEXT_MODEL env var.
+# Matches the LE domain console model configured for NVIDIA NIM calls.
+TEXT_MODEL = os.environ.get("NVIDIA_TEXT_MODEL", "mistralai/mistral-small-4-119b-2603")
 
 WORKERS    = 3
 DELAY      = 1.2    # seconds between web searches
@@ -129,117 +211,73 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# WEB SEARCH
+# WEB SEARCH — Yandex backend only via the ddgs library.
+# DDG/Bing backends are heavily rate-limited (429/403) in our env, and the
+# html.duckduckgo.com scraper returns 202 / no-results pages, so both have
+# been dropped. Cooldown still kicks in on 429/403 from Yandex.
 # ---------------------------------------------------------------------------
-# Pinned to engines that actually return 200s in our environment.
-# Brave/Google/Mojeek/Yahoo (the default `auto` fan-out) hammer us with 429/403.
-# Yandex is the most reliable; DDG and Bing are secondary.
-_ENGINE_PREFERENCE = ['yandex', 'duckduckgo', 'bing']
-_ENGINE_COOLDOWN_UNTIL = {}
+_YANDEX_COOLDOWN_UNTIL = 0.0
 _engine_lock = threading.Lock()
 
 
-def _engine_is_cool(engine: str) -> bool:
+def _yandex_is_cool() -> bool:
     with _engine_lock:
-        return time.time() >= _ENGINE_COOLDOWN_UNTIL.get(engine, 0)
+        return time.time() >= _YANDEX_COOLDOWN_UNTIL
 
 
-def _engine_cooldown(engine: str, seconds: int):
+def _yandex_cooldown(seconds: int):
+    global _YANDEX_COOLDOWN_UNTIL
     until = time.time() + seconds
     with _engine_lock:
-        _ENGINE_COOLDOWN_UNTIL[engine] = max(_ENGINE_COOLDOWN_UNTIL.get(engine, 0), until)
+        _YANDEX_COOLDOWN_UNTIL = max(_YANDEX_COOLDOWN_UNTIL, until)
 
 
 def _ddgs_library_search(query: str, max_results=8):
-    """ddgs library, pinned to working engines (Yandex → DDG → Bing).
-
-    Per-engine cooldown on 429/403 so we don't keep hitting blocked backends.
-    """
+    """ddgs library pinned to Yandex backend (the only one returning 200s here)."""
     try:
         from ddgs import DDGS
     except Exception as e:
         log.debug(f"ddgs import failed: {e}")
         return []
 
-    last_err = None
-    for engine in _ENGINE_PREFERENCE:
-        if not _engine_is_cool(engine):
-            log.debug(f"skip {engine} (cooling)")
-            continue
-        for attempt in range(2):
-            try:
-                results = []
-                with DDGS() as ddgs:
-                    for r in ddgs.text(query, max_results=max_results, backend=engine):
-                        results.append({
-                            'url': r.get('href', ''),
-                            'title': r.get('title', ''),
-                            'snippet': r.get('body', ''),
-                        })
-                if results:
-                    return results
-                break  # empty but not an error → next engine
-            except Exception as e:
-                last_err = e
-                err = str(e).lower()
-                if '429' in err or 'ratelimit' in err or '403' in err:
-                    cool = 60 if engine == 'yandex' else 180
-                    _engine_cooldown(engine, cool)
-                    log.warning(f"{engine} blocked ({err[:60]}) — cooldown {cool}s")
-                    break
-                if 'timed out' in err or 'timeout' in err:
-                    time.sleep(1)
-                    continue
-                log.debug(f"{engine} error: {e}")
-                break
-    if last_err:
-        log.debug(f"all pinned engines failed, last err: {last_err}")
-    return []
+    if not _yandex_is_cool():
+        log.debug("skip yandex (cooling)")
+        return []
 
-
-def _duckduckgo_html_search(query: str, max_results=8):
-    """Fallback: scrape DDG HTML directly with 429 handling."""
-    from urllib.parse import quote_plus
-    for ddg_attempt in range(2):
+    for attempt in range(2):
         try:
-            url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-            resp = requests.get(url, headers=HTTP_HEADERS, timeout=15)
-            if resp.status_code == 429 or resp.status_code == 202:
-                wait = 5 * (ddg_attempt + 1)
-                log.warning(f"DDG HTML {resp.status_code} — backing off {wait}s")
-                time.sleep(wait)
-                continue
             results = []
-            for m in re.finditer(
-                r'<a[^>]+class="result__url"[^>]*>([^<]+)</a>.*?'
-                r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-                resp.text, re.DOTALL
-            ):
-                href = m.group(1).strip()
-                snippet = re.sub(r'<[^>]+>', '', m.group(2)).strip()
-                if href and not href.startswith('javascript'):
-                    if not href.startswith('http'):
-                        href = 'https://' + href
-                    results.append({'url': href, 'title': href, 'snippet': snippet})
-            if results:
-                return results[:max_results]
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results, backend='yandex'):
+                    results.append({
+                        'url': r.get('href', ''),
+                        'title': r.get('title', ''),
+                        'snippet': r.get('body', ''),
+                    })
+            return results
         except Exception as e:
-            log.debug(f"DDG HTML error: {e}")
+            err = str(e).lower()
+            if '429' in err or 'ratelimit' in err or '403' in err:
+                _yandex_cooldown(60)
+                log.warning(f"yandex blocked ({err[:60]}) — cooldown 60s")
+                return []
+            if 'timed out' in err or 'timeout' in err:
+                time.sleep(1)
+                continue
+            log.debug(f"yandex error: {e}")
+            return []
     return []
 
 
 def web_search(query: str, retries=3):
-    """Search with ddgs library first, then HTML scrape fallback, with retries + backoff."""
+    """Yandex-only search via ddgs library, with backoff retries."""
     for attempt in range(retries):
         r = _ddgs_library_search(query)
         if r:
             return r
-        r = _duckduckgo_html_search(query)
-        if r:
-            return r
         if attempt < retries - 1:
             wait = 2 * (attempt + 1)
-            log.debug(f"web_search attempt {attempt+1} failed, retrying in {wait}s...")
+            log.debug(f"web_search attempt {attempt+1} empty, retrying in {wait}s...")
             time.sleep(wait)
     return []
 
@@ -282,14 +320,18 @@ def fetch_domain_pages(domain: str) -> str:
 # AI CALL
 # ---------------------------------------------------------------------------
 def ai_call(prompt: str, max_tokens: int = 700, max_retries: int = 5) -> str:
-    if not NVIDIA_API_KEY:
-        raise RuntimeError("NVIDIA_API_KEY not set.")
+    if not NVIDIA_API_KEYS:
+        raise RuntimeError("No NVIDIA API keys configured "
+                           "(set NVIDIA_API_KEY or NVIDIA_API_KEYS).")
+    # Give the rotation enough room to try every key at least once.
+    max_retries = max(max_retries, len(NVIDIA_API_KEYS))
     for attempt in range(max_retries):
+        key = _next_nvidia_key()
         try:
             resp = requests.post(
                 'https://integrate.api.nvidia.com/v1/chat/completions',
                 headers={'Content-Type': 'application/json',
-                         'Authorization': f'Bearer {NVIDIA_API_KEY}'},
+                         'Authorization': f'Bearer {key}'},
                 json={'model': TEXT_MODEL,
                       'messages': [
                           {'role': 'system', 'content': 'You are a precise entity verifier. Respond only with valid JSON.'},
@@ -316,8 +358,16 @@ def ai_call(prompt: str, max_tokens: int = 700, max_retries: int = 5) -> str:
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else 0
             if attempt < max_retries - 1:
-                wait = 2 ** attempt + 1
-                log.warning(f"HTTP {status_code} (attempt {attempt+1}/{max_retries}): {e} — retrying in {wait}s")
+                if status_code == 429:
+                    # We rotate to a fresh key on the next attempt, so don't
+                    # sit out the full per-minute window — a short pause is
+                    # enough. Honor Retry-After only if it's small.
+                    ra = e.response.headers.get('Retry-After') if e.response is not None else None
+                    wait = min(int(ra), 5) if (ra and ra.isdigit()) else 1
+                    log.warning(f"HTTP 429 (attempt {attempt+1}/{max_retries}) — rotating key, retrying in {wait}s")
+                else:
+                    wait = 2 ** attempt + 1
+                    log.warning(f"HTTP {status_code} (attempt {attempt+1}/{max_retries}): {e} — retrying in {wait}s")
                 time.sleep(wait)
             else:
                 raise
@@ -827,14 +877,16 @@ def vicon(v):
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
-    global NVIDIA_API_KEY
+    global NVIDIA_API_KEYS, NVIDIA_API_KEY
 
-    # API key
-    if not NVIDIA_API_KEY:
-        NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-    if not NVIDIA_API_KEY:
-        log.error("NVIDIA_API_KEY not set! export NVIDIA_API_KEY=nvapi-...")
+    # API keys — rebuild the pool in case env was populated after import.
+    if not NVIDIA_API_KEYS:
+        NVIDIA_API_KEYS = _load_nvidia_keys()
+        NVIDIA_API_KEY = NVIDIA_API_KEYS[0] if NVIDIA_API_KEYS else ""
+    if not NVIDIA_API_KEYS:
+        log.error("No NVIDIA keys! set NVIDIA_API_KEY=nvapi-... or NVIDIA_API_KEYS=nvapi-...,nvapi-...")
         sys.exit(1)
+    log.info(f"NVIDIA key pool: {len(NVIDIA_API_KEYS)} key(s) loaded for rotation")
 
     # le.csv
     csv_path = LE_CSV

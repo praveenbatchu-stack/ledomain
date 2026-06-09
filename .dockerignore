@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.log
+*.xlsx
+*.bak
+.env
+.streamlit/secrets.toml
+credentials/
+../credentials/
+streamlit.log
+people_validation.log
